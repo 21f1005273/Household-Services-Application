@@ -1,0 +1,427 @@
+openapi: 3.0.3
+info:
+  title: Scam Call Detection API
+  description: |
+    Real-time scam call detection system that processes audio recordings,
+    analyzes them using AI, and provides scam probability scores.
+    
+    ## Features
+    - Real-time audio chunk processing (10-second intervals)
+    - Encrypted audio transmission to AI server
+    - Live probability polling during calls
+    - Complete call transcription and keyword extraction
+    
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+
+tags:
+  - name: Call Management
+    description: Start, stop, and manage call sessions
+  - name: Real-time Monitoring
+    description: Poll live scam probabilities during calls
+  - name: Results & Analytics
+    description: Retrieve complete call analysis and results
+
+paths:
+  /call/start-call:
+    post:
+      tags:
+        - Call Management
+      summary: Start a new call session
+      description: |
+        Initiates a new call session by:
+        1. Validating phone number and checking audio file exists
+        2. Creating database entry with unique session UUID
+        3. Renaming audio file to include UUID
+        4. Starting background audio processing (chunking + AI analysis)
+        5. Initializing real-time probability cache
+
+      operationId: startCall
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - scammer_ph_number
+              properties:
+                scammer_ph_number:
+                  type: string
+                  description: Phone number of the scammer (must match audio filename)
+                  example: "9876543210"
+            examples:
+              valid_call:
+                summary: Valid phone number
+                value:
+                  scammer_ph_number: "9876543210"
+      responses:
+        '201':
+          description: Call session created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_uuid:
+                    type: string
+                    format: uuid
+                    description: Unique identifier for this call session
+                    example: "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+                  start_time:
+                    type: string
+                    format: date-time
+                    description: Timestamp when call started
+                    example: "2025-11-16T10:30:00"
+                  message:
+                    type: string
+                    example: "Call started - audio processing running in parallel"
+        '404':
+          description: Audio file not found for phone number
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                detail: "No audio file found for phone number: 9876543210"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /call/probability/{session_uuid}:
+    get:
+      tags:
+        - Real-time Monitoring
+      summary: Get real-time scam probability (fast polling)
+      description: |
+        Returns current scam probability from in-memory cache in real-time        
+        Frontend should poll this endpoint every 2 seconds during active calls.
+        Updates automatically as AI processes each 10-second audio chunk.
+      operationId: getProbability
+      parameters:
+        - name: session_uuid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Session UUID from start-call response
+          example: "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+      responses:
+        '200':
+          description: Current probability retrieved from cache
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  probability:
+                    type: number
+                    format: float
+                    minimum: 0.0
+                    maximum: 1.0
+                    description: Scam probability score (0.0 - 1.0)
+                    example: 0.88
+                  is_scam:
+                    type: boolean
+                    description: True if probability >= 0.8
+                    example: true
+                  chunk_index:
+                    type: integer
+                    description: Index of last processed chunk
+                    example: 3
+                  timestamp:
+                    type: string
+                    format: date-time
+                    description: When this probability was last updated
+                    example: "2025-11-16T10:30:40"
+        '400':
+          description: Invalid session UUID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Session not found or not started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Failed to retrieve probability
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /call/stop/{session_uuid}:
+    put:
+      tags:
+        - Call Management
+      summary: Stop call (mark as ended)
+      description: |
+        Marks the call as ended by setting `end_time` in database.
+        **Does NOT cleanup chunks or clear cache** - call `/cleanup/{uuid}` separately.
+        
+        Use this when user hangs up and you want instant confirmation.
+      operationId: stopCall
+      parameters:
+        - name: session_uuid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+      responses:
+        '200':
+          description: Call stopped successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_uuid:
+                    type: string
+                    format: uuid
+                    example: "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+                  end_time:
+                    type: string
+                    format: date-time
+                    example: "2025-11-16T10:30:50"
+                  duration:
+                    type: number
+                    format: float
+                    description: Call duration in seconds
+                    example: 50.0
+                  message:
+                    type: string
+                    example: "Call stopped. Chunks not yet cleaned up."
+        '400':
+          description: Session UUID empty or call already stopped
+        '404':
+          description: Session not found
+        '500':
+          description: Failed to stop call
+
+  /call/cleanup/{session_uuid}:
+    post:
+      tags:
+        - Call Management
+      summary: Cleanup temporary files and cache
+      description: |
+        Deletes temporary audio chunks and clears in-memory cache.
+        Can be called after `/stop/{uuid}` or independently.
+        **Idempotent** - safe to call multiple times.
+        
+        Does NOT require database access.
+      operationId: cleanupCall
+      parameters:
+        - name: session_uuid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+      responses:
+        '200':
+          description: Cleanup completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_uuid:
+                    type: string
+                    format: uuid
+                    example: "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+                  chunks_cleaned:
+                    type: boolean
+                    description: Whether chunk files were deleted
+                    example: true
+                  cache_cleared:
+                    type: boolean
+                    description: Whether cache entry was removed
+                    example: true
+                  message:
+                    type: string
+                    example: "Cleanup complete"
+        '400':
+          description: Invalid session UUID
+
+  /call/results/{session_uuid}:
+    get:
+      tags:
+        - Results & Analytics
+      summary: Get complete call analysis
+      description: |
+        Returns comprehensive call results including:
+        - Session info (times, duration)
+        - Scam detection (probability, risk level)
+        - Content analysis (transcription, keywords)
+        
+        Call this after the call ends to get full analysis.
+        May return incomplete data if AI processing is still running.
+      operationId: getCallResults
+      parameters:
+        - name: session_uuid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+      responses:
+        '200':
+          description: Complete call analysis
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_uuid:
+                    type: string
+                    format: uuid
+                    example: "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+                  scammer_ph_number:
+                    type: string
+                    example: "9876543210"
+                  start_time:
+                    type: string
+                    format: date-time
+                    example: "2025-11-16T10:30:00"
+                  end_time:
+                    type: string
+                    format: date-time
+                    nullable: true
+                    example: "2025-11-16T10:30:50"
+                  duration:
+                    type: number
+                    format: float
+                    nullable: true
+                    description: Call duration in seconds
+                    example: 50.0
+                  detected_as_scam:
+                    type: boolean
+                    description: True if probability >= 0.8
+                    example: true
+                  probability:
+                    type: number
+                    format: float
+                    description: Final scam probability (0.0 - 1.0)
+                    example: 0.88
+                  risk_level:
+                    type: string
+                    enum: [low, medium, high]
+                    description: |
+                      Risk classification:
+                      - high: probability >= 0.7
+                      - medium: 0.3 <= probability < 0.7
+                      - low: probability < 0.3
+                    example: "high"
+                  keywords:
+                    type: array
+                    items:
+                      type: string
+                    description: Extracted scam-related keywords
+                    example: ["loan", "OTP", "bank", "verify", "CVV"]
+                  transcription:
+                    type: string
+                    nullable: true
+                    description: Complete call transcription
+                    example: "Hello sir, your loan has been approved. Please verify your bank account details..."
+                  window_transcriptions:
+                    type: array
+                    items:
+                      type: string
+                    description: Transcriptions of individual 10-second chunks
+                    example: 
+                      - "Hello sir, your loan has been approved"
+                      - "Please verify your bank account details"
+                  processing_complete:
+                    type: boolean
+                    description: Whether AI processing has finished
+                    example: true
+        '400':
+          description: Invalid session UUID
+        '404':
+          description: Session not found
+        '500':
+          description: Failed to retrieve results
+
+AiAnalyzer:
+  description: "Continuously receives 10s audio input, transcribes, embeds, and calculates similarity using FAISS"
+  fields:
+    raw_embeddings:
+      type: "list[float]"
+      description: "Stores raw embeddings of one or more chunks"
+    faiss_embeddings:
+      type: "list[float]"
+      description: "Stores FAISS embeddings of one or more chunks"
+    window_transcriptions:
+      type: "list[str]"
+      description: "Stores transcriptions of all 10-second windows"
+    output_similarity:
+      type: "float"
+      description: "Final similarity score returned for a evaluated chunk/window"
+    flag:
+      type: "bool"
+      description: "Stores classification result: scam or not scam"
+
+  methods:
+    getEmbeddings(chunk):
+      visibility: "public"
+      description: "Generate embeddings for provided chunk(s) and store them"
+
+    convertToFaiss():
+      visibility: "private"
+      description: "Converts .npy embedding format to FAISS compatible vectors"
+
+    calculateSimilarity():
+      visibility: "private"
+      description: "Computes similarity score for the respective chunk(s)"
+
+    getWindowTranscription(window_id):
+      visibility: "public"
+      description: "Returns transcription text for the requested audio window"
+
+  workflow:
+  steps:
+    - Capture continuous audio stream in 10-second windows
+    - Transcribe each window using OpenAI Whisper
+    - Generate embeddings from chunks using LLM embeddings API
+    - Convert embeddings to FAISS format
+    - Compare with knowledge base vectors using FAISS similarity search
+    - Produce similarity score
+    - Flag result as scam or not scam
+    - Repeat continuously while audio is streaming
+
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        detail:
+          type: string
+          description: Error message describing what went wrong
+          example: "Session not found"
+      required:
+        - detail
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Optional JWT authentication (if implemented)
+
+# Apply security globally (if needed)
+# security:
+#   - BearerAuth: []
