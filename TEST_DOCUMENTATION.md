@@ -1,4 +1,4 @@
-# ScamShield Backend - Testing Documentation
+# ScamShield Backend - Testing Documentation.
 
 **Project**: ScamShield - Real-time Scam Call Detection System
 **Testing Phase**: Milestone 5 - Software Testing (Backend API)
